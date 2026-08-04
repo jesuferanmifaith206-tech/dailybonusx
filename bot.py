@@ -1,11 +1,11 @@
 import os
 import logging
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
-import redis
 import random
 
 # Load environment variables
@@ -18,35 +18,97 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Redis connection for data storage
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
-redis_client = redis.Redis.from_url(REDIS_URL)
-
 # Bot token from environment variable
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+if not TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not set!")
+    exit(1)
 
 # Constants
 DAILY_BONUS_AMOUNT = 100
 STREAK_BONUS = {1: 50, 2: 75, 3: 100, 4: 150, 5: 200, 6: 250, 7: 500}
+
+# SQLite Database Setup
+DB_NAME = 'bot_data.db'
+
+def get_db():
+    """Get database connection."""
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Initialize database tables."""
+    with get_db() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT,
+                points INTEGER DEFAULT 0,
+                streak INTEGER DEFAULT 0,
+                last_claim TEXT DEFAULT '',
+                total_claimed INTEGER DEFAULT 0,
+                referral_code TEXT,
+                referrals INTEGER DEFAULT 0,
+                last_spin TEXT DEFAULT '',
+                referral_bonus_given INTEGER DEFAULT 0
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                referral_code TEXT,
+                user_id TEXT,
+                referred_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        conn.commit()
+        logger.info("✅ Database initialized!")
+
+def get_user(user_id):
+    """Get user data from database."""
+    with get_db() as conn:
+        cursor = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+def create_user(user_id, username):
+    """Create new user in database."""
+    referral_code = generate_referral_code(user_id)
+    with get_db() as conn:
+        conn.execute('''
+            INSERT INTO users (user_id, username, referral_code)
+            VALUES (?, ?, ?)
+        ''', (user_id, username, referral_code))
+        conn.commit()
+    return get_user(user_id)
+
+def update_user(user_id, data):
+    """Update user data in database."""
+    fields = []
+    values = []
+    for key, value in data.items():
+        fields.append(f"{key} = ?")
+        values.append(value)
+    values.append(user_id)
+    
+    with get_db() as conn:
+        conn.execute(f'UPDATE users SET {", ".join(fields)} WHERE user_id = ?', values)
+        conn.commit()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a welcome message when /start is issued."""
     user = update.effective_user
     user_id = str(user.id)
     
-    # Initialize user data if not exists
-    if not redis_client.exists(f"user:{user_id}"):
-        user_data = {
-            'username': user.username or user.full_name,
-            'points': 0,
-            'streak': 0,
-            'last_claim': '',
-            'total_claimed': 0,
-            'referral_code': generate_referral_code(user_id),
-            'referrals': 0,
-            'last_spin': ''
-        }
-        redis_client.set(f"user:{user_id}", json.dumps(user_data))
+    # Check if user exists, create if not
+    user_data = get_user(user_id)
+    if not user_data:
+        user_data = create_user(user_id, user.username or user.full_name)
+        logger.info(f"New user: {user_id}")
     
     welcome_message = f"""
 🎮 *Welcome to Daily Bonus Bot!* 🎮
@@ -94,7 +156,11 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         message = update.message
     
     try:
-        user_data = json.loads(redis_client.get(f"user:{user_id}"))
+        user_data = get_user(user_id)
+        if not user_data:
+            await message.reply_text("❌ User not found. Please use /start first.")
+            return
+        
         today = datetime.now().strftime('%Y-%m-%d')
         last_claim = user_data.get('last_claim', '')
         
@@ -115,12 +181,12 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         bonus = DAILY_BONUS_AMOUNT + STREAK_BONUS.get(streak, 50)
         
         # Update user data
-        user_data['points'] += bonus
-        user_data['streak'] = streak
-        user_data['last_claim'] = today
-        user_data['total_claimed'] += bonus
-        
-        redis_client.set(f"user:{user_id}", json.dumps(user_data))
+        update_user(user_id, {
+            'points': user_data['points'] + bonus,
+            'streak': streak,
+            'last_claim': today,
+            'total_claimed': user_data['total_claimed'] + bonus
+        })
         
         # Send success message
         streak_message = f"🔥 *{streak} DAY STREAK!*" if streak > 1 else "🌟 *First day!*"
@@ -129,7 +195,7 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🎉 *Daily Bonus Claimed!*\n\n"
             f"{streak_message}\n"
             f"💰 Bonus: +{bonus} points\n"
-            f"📊 Total Points: {user_data['points']}\n"
+            f"📊 Total Points: {user_data['points'] + bonus}\n"
             f"📈 Streak: {streak} days\n\n"
             f"💡 Claim again tomorrow for even bigger rewards!"
         )
@@ -155,17 +221,21 @@ async def spin_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         message = update.message
     
     try:
-        user_data = json.loads(redis_client.get(f"user:{user_id}"))
+        user_data = get_user(user_id)
+        if not user_data:
+            await message.reply_text("❌ User not found. Please use /start first.")
+            return
         
         # Check cooldown (1 hour between spins)
         last_spin = user_data.get('last_spin', '')
         if last_spin:
             last_spin_time = datetime.fromisoformat(last_spin)
-            if datetime.now() - last_spin_time < timedelta(hours=1):
-                wait_time = 60 - (datetime.now() - last_spin_time).seconds // 60
+            time_diff = datetime.now() - last_spin_time
+            if time_diff < timedelta(hours=1):
+                wait_minutes = 60 - int(time_diff.total_seconds() // 60)
                 response = (
                     f"⏳ *Wait!*\n"
-                    f"You need to wait {wait_time} minutes between spins!"
+                    f"You need to wait {wait_minutes} minutes between spins!"
                 )
                 if query:
                     await query.edit_message_text(response, parse_mode='Markdown')
@@ -183,9 +253,11 @@ async def spin_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             multiplier = 2
             reward *= 2
         
-        user_data['points'] += reward
-        user_data['last_spin'] = datetime.now().isoformat()
-        redis_client.set(f"user:{user_id}", json.dumps(user_data))
+        # Update user data
+        update_user(user_id, {
+            'points': user_data['points'] + reward,
+            'last_spin': datetime.now().isoformat()
+        })
         
         emojis = ["🎰", "✨", "🎯", "💎", "🌟", "🎲"]
         result_emoji = random.choice(emojis)
@@ -197,7 +269,7 @@ async def spin_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 💰 *+{reward} points* {'🎉 DOUBLE!' if multiplier == 2 else ''}
 
-📊 Total Points: {user_data['points']}
+📊 Total Points: {user_data['points'] + reward}
 
 ⏰ Spin again in 1 hour!
 """
@@ -223,7 +295,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.message
     
     try:
-        user_data = json.loads(redis_client.get(f"user:{user_id}"))
+        user_data = get_user(user_id)
+        if not user_data:
+            await message.reply_text("❌ User not found. Please use /start first.")
+            return
         
         stats_message = f"""
 📊 *Your Stats* 📊
@@ -257,9 +332,12 @@ async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     
     try:
-        user_data = json.loads(redis_client.get(f"user:{user_id}"))
-        referral_code = user_data.get('referral_code')
+        user_data = get_user(user_id)
+        if not user_data:
+            await update.message.reply_text("❌ User not found. Please use /start first.")
+            return
         
+        referral_code = user_data.get('referral_code')
         bot_username = (await context.bot.get_me()).username
         
         referral_message = f"""
@@ -295,13 +373,16 @@ async def handle_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = str(update.effective_user.id)
     
     try:
-        # Add bonus for new user
-        user_data = json.loads(redis_client.get(f"user:{user_id}"))
+        user_data = get_user(user_id)
+        if not user_data:
+            await update.message.reply_text("❌ Please use /start first.")
+            return
         
-        if 'referral_bonus_given' not in user_data:
-            user_data['points'] += 25
-            user_data['referral_bonus_given'] = True
-            redis_client.set(f"user:{user_id}", json.dumps(user_data))
+        if user_data.get('referral_bonus_given', 0) == 0:
+            update_user(user_id, {
+                'points': user_data['points'] + 25,
+                'referral_bonus_given': 1
+            })
             
             await update.message.reply_text(
                 "✅ *Welcome!* 🎉\n\n"
@@ -332,21 +413,22 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         message = update.message
     
     try:
-        # Get top users
-        top_users = []
-        keys = redis_client.keys('user:*')
-        for key in keys[:20]:
-            user_data = json.loads(redis_client.get(key))
-            username = user_data.get('username', 'Anonymous')
-            points = user_data.get('points', 0)
-            top_users.append((username, points))
-        
-        top_users.sort(key=lambda x: x[1], reverse=True)
+        with get_db() as conn:
+            cursor = conn.execute('''
+                SELECT username, points, streak
+                FROM users
+                ORDER BY points DESC
+                LIMIT 10
+            ''')
+            top_users = cursor.fetchall()
         
         leaderboard_text = "🏆 *Leaderboard* 🏆\n\n"
-        for i, (username, points) in enumerate(top_users[:10], 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            leaderboard_text += f"{medal} {username}: {points} pts\n"
+        if not top_users:
+            leaderboard_text += "No users yet. Be the first!"
+        else:
+            for i, row in enumerate(top_users, 1):
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                leaderboard_text += f"{medal} {row['username']}: {row['points']} pts 🔥{row['streak']}d\n"
         
         if query:
             await query.edit_message_text(leaderboard_text, parse_mode='Markdown')
@@ -383,8 +465,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 • Keep your streak alive for bigger rewards
 • Share your referral link with friends
 • Check back daily for special events
-
-Need more help? Contact @support_username
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -402,11 +482,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == 'leaderboard':
         await leaderboard(update, context)
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors."""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and hasattr(update, 'effective_message'):
+        await update.effective_message.reply_text(
+            "❌ An error occurred. Please try again later."
+        )
+
 def main() -> None:
     """Start the bot."""
-    if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not set!")
-        return
+    logger.info("🚀 Starting Daily Bonus Bot...")
+    
+    # Initialize database
+    init_db()
     
     # Create application
     application = Application.builder().token(TOKEN).build()
@@ -425,6 +514,11 @@ def main() -> None:
     
     # Referral handler
     application.add_handler(MessageHandler(filters.Regex('^/start '), handle_referral))
+    
+    # Error handler
+    application.add_error_handler(error_handler)
+    
+    logger.info("✅ Bot is ready! Listening for updates...")
     
     # Run the bot
     application.run_polling()
