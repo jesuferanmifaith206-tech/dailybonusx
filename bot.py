@@ -19,7 +19,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Redis connection for data storage
-redis_client = redis.Redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379'))
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+redis_client = redis.Redis.from_url(REDIS_URL)
 
 # Bot token from environment variable
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -48,7 +49,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         redis_client.set(f"user:{user_id}", json.dumps(user_data))
     
     welcome_message = f"""
-🎮 *Welcome to Play Smart Bonus Bot!* 🎮
+🎮 *Welcome to Daily Bonus Bot!* 🎮
 
 Hi {user.full_name}! 👋
 
@@ -294,11 +295,9 @@ async def handle_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = str(update.effective_user.id)
     
     try:
-        # Find the user by referral code (in production, store reverse mapping)
-        # For demo, we'll just give bonus
+        # Add bonus for new user
         user_data = json.loads(redis_client.get(f"user:{user_id}"))
         
-        # Add bonus for new user
         if 'referral_bonus_given' not in user_data:
             user_data['points'] += 25
             user_data['referral_bonus_given'] = True
@@ -379,7 +378,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 • Daily check-in bonuses (increasing rewards)
 • Spin the wheel every hour
 • Refer friends and earn rewards
-• Complete bonus challenges
 
 💡 *Tips:*
 • Keep your streak alive for bigger rewards
@@ -397,13 +395,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     if query.data == 'claim_daily':
         await daily_bonus(update, context)
-        
     elif query.data == 'spin_wheel':
         await spin_wheel(update, context)
-        
     elif query.data == 'show_stats':
         await stats(update, context)
-        
     elif query.data == 'leaderboard':
         await leaderboard(update, context)
 
